@@ -66,12 +66,127 @@ make build EXTRA_FLAGS="-DOPK_LOG=1"                  # add your own defines
 make build FQBN=adafruit:nrf52:somethingelse          # a different nRF52840 board
 ```
 
-**Calling `arduino-cli` directly** instead of `make`? Then you must supply the flags yourself — the build
-`#error`s without them (so a forgotten flag fails loudly instead of shipping a broken/deadlock-prone image):
+**Calling `arduino-cli` directly** instead of `make`? Supply both the USB defines and
+all three linker wrappers. Compile-time checks guard the USB defines; they do not
+replace the required linker flags:
 
 ```bash
-arduino-cli compile -b adafruit:nrf52:feather52840 --build-property "build.extra_flags=-DNRF52840_XXAA {build.flags.usb} -DCFG_TUD_HID=6 -DCFG_TUD_TASK_QUEUE_SZ=512 -DCFG_TUD_VENDOR_TX_BUFSIZE=256" OpenPuck
+arduino-cli compile -b adafruit:nrf52:feather52840 --build-property "build.extra_flags=-DNRF52840_XXAA {build.flags.usb} -DCFG_TUD_HID=6 -DCFG_TUD_TASK_QUEUE_SZ=512 -DCFG_TUD_VENDOR_TX_BUFSIZE=256" --build-property "compiler.c.elf.extra_flags=-Wl,--wrap=tud_vendor_control_xfer_cb -Wl,--wrap=tud_descriptor_string_cb -Wl,--wrap=usbd_control_xfer_cb" OpenPuck
 ```
+
+The wrappers route vendor control requests, preserve the full 178-byte Xbox
+security string, and validate actual EP0 OUT transfer lengths respectively.
+`make build` includes all three through `OPENPUCK_LINK_FLAGS`; do not drop any
+when overriding that variable.
+
+### Xbox 360 build and validation status
+
+The default `adafruit:nrf52:feather52840` build passed with **Adafruit nRF52 core
+1.7.0**. The Xbox 360 firmware has **not been flashed or tested on a console**;
+stock-console support remains experimental and awaiting validation. It runs
+retail authentication in software on the existing nRF52840 OpenPuck, with no
+donor controller or added hardware.
+
+From the repository root, the non-hardware checks are:
+
+```bash
+python3 tools/test-xinput.py --check-fixtures
+make check
+make build
+```
+
+Native tests require Python 3, C11/C++17 compilers, and OpenSSL for independent
+fixture regeneration. These are **synthetic fixtures, not console captures**;
+passing tests and a firmware build do not prove physical USB operation or stock
+console compatibility. See [../tests/xinput/README.md](../tests/xinput/README.md)
+for harness limits and [XBOX360.md](XBOX360.md) for the physical test checklist.
+
+Before distributing firmware, retain the libxsm3 **LGPL-2.1-or-later**, ExCrypt
+**BSD-3-Clause**, and descriptor **MIT** notices and license texts. Static
+firmware redistribution must also satisfy applicable LGPL source/relinking
+requirements, not just include a license notice. See
+[../OpenPuck/src/libxsm3/NOTICE.md](../OpenPuck/src/libxsm3/NOTICE.md),
+[../OpenPuck/src/libxsm3/LICENSE.txt](../OpenPuck/src/libxsm3/LICENSE.txt), and
+[XBOX360.md](XBOX360.md#licensing-and-redistribution).
+
+### 4a. Raytac MDBT50Q-CX-40
+
+Retail listings may shorten MDBT50Q-CX-40 to `MDBT50Q-CX`. This target is only
+for the nRF52840 model with 1 MB flash and 256 KB RAM, not the CX-33.
+
+The build borrows Adafruit's `adafruit:nrf52:mdbt50qrx` profile for its
+nRF52840, S140, and linker settings; it does not modify that installed profile.
+CX-40 GPIO differences remain in OpenPuck.
+
+#### Prerequisites
+
+Download [nRF Util](https://www.nordicsemi.com/Products/Development-tools/nRF-Util)
+and put it in your path.
+
+```bash
+mkdir -p ~/.local/bin
+install -m 755 ~/Downloads/nrfutil ~/.local/bin/nrfutil
+export PATH="$HOME/.local/bin:$PATH"
+
+# Install the DFU packaging and flashing commands.
+nrfutil --version
+nrfutil install nrf5sdk-tools
+nrfutil install device
+```
+
+#### First-time S140 provisioning
+
+OpenPuck requires S140 6.1.1 (`0xB6`). Download and extract Nordic's
+[nRF5 SDK](https://www.nordicsemi.com/Products/Development-software/nRF5-SDK) v15.3.0,
+then provision its SoftDevice before installing OpenPuck for the first time:
+
+```bash
+# Hold the dongle button while inserting it; release when the LED fades.
+SDK=/path/to/nRF5_SDK
+make provision-raytac-softdevice \
+  SOFTDEVICE_HEX="$SDK/components/softdevice/s140/hex/\
+s140_nrf52_6.1.1_softdevice.hex"
+
+# Unplug the dongle and re-enter Open DFU before installing the application.
+```
+
+Provisioning is separate from routine builds and updates.
+
+#### Build and flash
+
+```bash
+# Build and create a Nordic Secure DFU application package.
+./gen_version.sh   # recommended: embeds version (when tagged) + git hash provenance
+make build-raytac
+make package-raytac
+
+# Enter physical Open DFU mode, then flash the package.
+make flash-raytac
+
+# For later updates, this runs all three commands above.
+make deploy-raytac
+```
+
+The Adafruit compile recipe also emits `build/raytac/OpenPuck.ino.zip` in its
+older DFU v0.5 format; ignore that automatic output. `make package-raytac`
+creates `OpenPuck-mdbt50q-cx-40.zip`, the Secure DFU package used by the
+factory Open DFU bootloader. These targets do not replace that bootloader or
+use `arduino-cli upload`.
+
+The relevant flash layout is:
+
+- S140 and the MBR occupy the region below the application.
+- OpenPuck starts at `0x26000` and must end before `0xED000`.
+- InternalFS occupies `0xED000` through `0xF3FFF`.
+- The factory bootloader occupies `0xF4000` through `0xFFFFF`.
+
+The populated active-low blue LED is P0.08. OpenPuck reserves it for the
+existing remote-wake diagnostic rather than connection or pairing state.
+The WebUSB firmware updater (§5b), its serial/UF2 DFU buttons, and the debug
+full-board wipe all target the Adafruit bootloader and are rejected by this
+build; use the physical Open DFU workflow above instead. The panel's factory
+erase (§6, filesystem-only) and the serial `ERASE-ALL` console command work
+normally.
 
 ## 5. Upload the firmware
 
@@ -85,6 +200,12 @@ make deploy /dev/cu.usbmodem1101   # build + flash in one step (same build overr
 Use the port for your OS: macOS `/dev/cu.usbmodem*`, Linux `/dev/ttyACM0`, Windows `COM5`.
 
 > **DFU note:** in puck (Steam/Lizard) mode the firmware drops the CDC serial port to free a USB endpoint, so `arduino-cli` can't auto-reset the board into its bootloader. If the upload can't connect, put the board in DFU mode first by **double-tapping RST**, then `make flash <bootloader-port>` (re-check `arduino-cli board list` — the port can change in DFU mode). The drag-and-drop UF2 path in §5b also works.
+
+Xbox 360 mode also has no CDC serial port, and deliberately omits WebUSB and wake
+HID. For configuration or WebUSB updates, connect to a PC and hold all four back
+buttons (**L4 + R4 + L5 + R5**) plus **A** to return to Steam mode. Afterward,
+**back-4 + X** returns to Xbox by default (X can be reassigned; A is fixed).
+Physical DFU remains the recovery path if no paired controller is available.
 
 ### Manual upload (without `make`)
 
@@ -151,11 +272,16 @@ Replace the port (`/dev/ttyACM0` / `COM5`) with the actual board port.
 
 ### Flashing from the WebUSB panel (no tools, no drag-and-drop)
 
+In Xbox 360 mode, first return to Steam mode with **back-4 + A** on a PC; the
+Xbox USB layout has no configuration/update interface.
+
 A board already running OpenPuck (status protocol v15+) can be updated entirely from the
 [WebUSB configurator](https://safijari.github.io/openpuck/)'s **Firmware update** tab: drag-and-drop a
 `.uf2` (or click to browse), or pick a version from the built-in **releases list** — each release offers the
 standard build or, via its checkbox, the `-factory-reset` build (wipes settings + pairing once on first
-boot). A blocking modal shows download/transfer/verify/apply progress and reports the old → new build once
+boot). Each entry shows the release's GitHub notes under a collapsible **release notes** toggle and, when
+the release is marked as a pre-release on GitHub, a **pre-release** badge (un-marking it on GitHub removes
+the badge on the next list refresh; pre-releases are never suggested by the "update available" notice). A blocking modal shows download/transfer/verify/apply progress and reports the old → new build once
 the puck reconnects. Under the hood the panel extracts the app image from the `.uf2` and streams it over the
 normal WebUSB connection into spare flash high in the app region (~15 s; the running firmware keeps working);
 the firmware CRC32-verifies what landed and commits a one-page "apply on reboot" record; a final automatic
@@ -167,6 +293,11 @@ reboot copies staged→app from RAM (~5 s dark) and comes back up on the new fir
 > onto the orphan **`firmware`** branch, and the panel downloads from
 > `raw.githubusercontent.com/safijari/openpuck/firmware/<asset>` (which is CORS-clean). If a release is
 > missing from the mirror, the panel falls back to opening the asset in a new tab for manual drag-and-drop.
+
+> **Release notes and the pre-release flag are owned by GitHub, not the workflow:** the release job uploads
+> its artifacts onto an existing release (`gh release upload --clobber`) and only authors a title/body when
+> it creates the release itself from a bare tag push. Notes written in the GitHub UI, a custom release
+> title, and the pre-release checkbox therefore survive the artifact build that follows publishing.
 
 Failure safety: **nothing is armed until the staged image verifies in flash**, so a disconnect, error, or
 power cut during the transfer leaves the current firmware untouched. The apply step erases the app's vector
@@ -188,12 +319,12 @@ Re-flashing firmware does **not** erase the board's internal LittleFS. The paire
   (`make build-recovery` is just `make build` plus `-DOPK_FACTORY_RESET=1`; the usual USB flags are still baked in.)
 
   It is **not** a wipe-every-boot image: after the one-time reset it stamps a tag file with the build's git hash, so subsequent boots skip the wipe and persist normally. Flashing this same image again won't re-wipe (the tag matches); flashing a **different** build (different git hash) re-triggers the one-time reset. For an on-demand wipe at any time, use the WebUSB button or serial `ERASE-ALL` below. Re-pair the controller after a reset.
-- **WebUSB panel (any mode):** open the panel (§8), and in the maintenance card click **⚠ Factory erase**. Confirm the two warning dialogs and type `ERASE` when prompted. The board reformats its filesystem and reboots to factory defaults. This works in every USB mode.
+- **WebUSB panel (a mode exposing WebUSB):** open the panel (§8), and in the maintenance card click **⚠ Factory erase**. Confirm the two warning dialogs and type `ERASE` when prompted. The board reformats its filesystem and reboots to factory defaults. From Xbox 360 mode, first return to Steam with **back-4 + A**.
 - **Serial console (CDC):** connect to the board's serial port at 115200 baud and send the line `ERASE-ALL` (exact, all caps). Same effect: reformat + reboot.
 
 Both reformat the entire internal filesystem (`cfg.bin` + `bonds.bin` and anything else), so the action is irreversible and the controller must be **re-paired afterwards** (see §7).
 
-Note on the serial method: puck (Steam/Lizard) mode drops the CDC console by default to free a USB endpoint for the wake-mouse interface, so the serial port may not be present in that mode. Either arm the one-shot debug CDC first (panel debug-CDC toggle / `D` console command, which keeps the console for the next boot), or just use the WebUSB **Factory erase** button, which is available in all modes.
+Note on the serial method: puck (Steam/Lizard) mode drops the CDC console by default to free a USB endpoint for the wake-mouse interface, so the serial port may not be present in that mode. Either arm the one-shot debug CDC first (panel debug-CDC toggle / `D` console command, which keeps the console for the next boot), or use the WebUSB **Factory erase** button in Steam mode. Xbox 360 mode exposes neither CDC nor WebUSB.
 
 ## 7. Pair and verify
 

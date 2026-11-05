@@ -20,6 +20,7 @@
 using namespace Adafruit_LittleFS_Namespace;
 
 #include "config.h"
+#include "board_config.h"
 
 // OPK_GIT_HASH: tags the one-time factory-reset build
 #include "build_info.h"
@@ -36,6 +37,7 @@ using namespace Adafruit_LittleFS_Namespace;
 #include "serial_console.h"
 #include "wake_hid.h"
 #include "status_led.h"
+#include "pwr_switch.h"
 #include "usb_mount.h"
 #include "identity.h"
 #include "fault_diag.h"
@@ -64,10 +66,11 @@ using namespace Adafruit_LittleFS_Namespace;
 // puck composite (4 HID + WebUSB) exceeds the default 256 B config buffer
 static uint8_t g_usbCfgDesc[512];
 
-// Per-mode USB serial suffix (modes 1..9: X=xbox N=hori L=lizard P=swpro S=ps5 G=hidgyro Q=ps5game D=ds4game 3=ps3).
-static const char MODE_SUFFIX[] = {
-	'X', 'N', 'L', 'P', 'S', 'G', 'Q', 'D', '3'
-};
+// Per-mode USB serial suffix (modes 1..MODE_MAX: X=xbox N=hori L=lizard P=swpro S=ps5 G=hidgyro Q=ps5game
+// D=ds4game 3=ps3 O=original-xbox J=dinput I=sinput).
+// 'C' is reserved for the CDC mode, see puck_hid.cpp
+static const char MODE_SUFFIX[] = { 'X', 'N', 'L', 'P', 'S', 'G',
+				    'Q', 'D', '3', 'O', 'J', 'I' };
 // Fixed-interface flags captured at boot so usbReenumerate (dynamic mount, no reboot) replays them.
 static bool s_dynWantWebusb = false, s_dynWantWakeMouse = false;
 
@@ -83,11 +86,11 @@ void usbReenumerate(uint8_t k)
 	USBDevice.setConfigurationBuffer(g_usbCfgDesc, sizeof g_usbCfgDesc);
 	g_active->usbIdentity(); // clearConfiguration reset VID/PID/strings -- restore them
 	// serial carries the mounted count so the host invalidates its cached config descriptor on a change
-	snprintf(
-		g_usbSerial, sizeof g_usbSerial, "%s%c%u", g_unit,
-		MODE_SUFFIX[(g_usbMode >= 1 && g_usbMode <= 9) ? g_usbMode - 1 :
-								 0],
-		(unsigned)k);
+	snprintf(g_usbSerial, sizeof g_usbSerial, "%s%c%u", g_unit,
+		 MODE_SUFFIX[(g_usbMode >= 1 && g_usbMode <= MODE_MAX) ?
+				     g_usbMode - 1 :
+				     0],
+		 (unsigned)k);
 	USBDevice.setSerialDescriptor(g_usbSerial);
 	if (s_dynWantWakeMouse)
 		wakeHidAddInterface(); // HID instance 0
@@ -123,13 +126,20 @@ void setup()
 	// full-board wipe (debug-only "erase everything"): if the panel armed one, this never returns -- it erases
 	// the app + config/bond + bootloader-settings flash from RAM and resets into the app-less UF2 bootloader.
 	// Checked before the staged-update apply (both use the meta page; only one can be armed at a time).
+	// Both are Adafruit-bootloader-specific (UF2 recovery drive + Adafruit-format settings page), so on
+	// boards without one they're compiled out -- the panel ops that arm them are rejected there too.
+#if OPK_HAS_ADAFRUIT_DFU
 	fwupWipeIfArmed();
 	// staged firmware update (WebUSB "flash on reboot"): if the panel committed one, this never returns --
 	// it copies staged->app from RAM and resets into the new firmware. MUST run before anything else touches
 	// hardware; the board looks dead for the ~5 s the copy takes.
 	fwupApplyIfArmed();
+#endif
 	genSerial();
 	ledInit();
+#if OPK_PWR_SWITCH
+	pwrSwitchInit();
+#endif
 
 	// seed defaults so unbonded slots don't share the discovery address
 	for (int s = 0; s < NSLOT; s++)
@@ -141,6 +151,7 @@ void setup()
 	factoryResetOnce(OPK_GIT_HASH);
 #endif
 	loadCfg();
+	rfApplyStartupLastGoodChannel();
 	loadBonds();
 	// Lizard (desktop) keyboard/mouse binding table. Custom remapping applies ONLY in pure
 	// MODE_LIZARD: there we install the user's saved/editable map. In every other mode the
@@ -174,6 +185,7 @@ void setup()
 	// clean-PS modes skip BOTH the wake mouse and WebUSB -- no config panel / host-wake; chord back to Steam
 	// (back-paddle 4 + A) to reach the panel. Normal MODE_PS5 / MODE_HIDGYRO keep wake + panel.
 	const bool psClean = modeIsCleanPS(g_usbMode);
+	const bool xboxClean = g_usbMode == MODE_XBOX;
 	const bool dynamic = g_active->dynamicMount();
 
 	if (dynamic) {
@@ -235,12 +247,12 @@ void setup()
 		// Boot-mouse wake interface for clean (non-puck) modes, and for puck on the one-shot debug boot (CDC on,
 		// no endpoint room for wake mouse on a normal puck boot -- wake is registered above instead). Skipped for PS
 		// modes so the device stays a single clean HID gamepad (see psClean above).
-		if (!puckMode && !keepCdc && !psClean)
+		if (!puckMode && !keepCdc && !psClean && !xboxClean)
 			wakeHidBegin();
 
 		// WebUSB config panel -- every mode EXCEPT the PlayStation modes. Puck: registered above (IF 0) before wake +
 		// slots; other clean modes after controller. PS modes omit it to present a genuine single-HID PS controller.
-		if (!puckMode && !psClean)
+		if (!puckMode && !psClean && !xboxClean)
 			usb_web.begin();
 		// bmAttributes: required(0x80) | remote_wakeup(0x20). Remote Wakeup lets us signal wake-from-sleep.
 		// The PS3/Sixaxis (the only clean-PS mode on this static path) advertises 0x80 only -- match it so a
@@ -264,11 +276,13 @@ void setup()
 	webusbInit(); // also drain the WebUSB status blob from the usbd task (its flush() can block loop() too)
 	hapticInit();
 	static const char *MODE_NAME[] = {
-		"STEAM(puck)",	       "XBOX(xinput+mouse)",
-		"SWITCH(horipad)",     "LIZARD(puck kb/mouse)",
-		"SWITCH(pro+gyro)",    "PS5(dualsense)",
-		"HIDGYRO(ds4+motion)", "PS5(dualsense,game/clean)",
-		"DS4(ds4,game/clean)", "PS3(dualshock3/sixaxis)"
+		"STEAM(puck)",		 "XBOX(xinput+mouse)",
+		"SWITCH(horipad)",	 "LIZARD(puck kb/mouse)",
+		"SWITCH(pro+gyro)",	 "PS5(dualsense)",
+		"HIDGYRO(ds4+motion)",	 "PS5(dualsense,game/clean)",
+		"DS4(ds4,game/clean)",	 "PS3(dualshock3/sixaxis)",
+		"XBOX-OG(controller s)", "DINPUT(joystick+motion)",
+		"SINPUT(sdl-native)"
 	};
 	Serial.printf("# copycat up: unit=%s board=%s, mode=%s\n", g_unit,
 		      g_board,
@@ -378,6 +392,9 @@ void loop()
 	faultDiagSetStage(6);
 	ledTask();
 	acc[6] += (uint32_t)(micros() - t);
+#if OPK_PWR_SWITCH
+	pwrSwitchTask();
+#endif
 	faultDiagSetStage(7);
 	usbMountTask(); // dynamic mount/unmount of connected controllers (no-op unless enabled)
 	faultDiagSetStage(8);
@@ -418,6 +435,9 @@ void loop()
 	hapticTask();
 	faultDiagSetStage(6);
 	ledTask();
+#if OPK_PWR_SWITCH
+	pwrSwitchTask();
+#endif
 	faultDiagSetStage(7);
 	usbMountTask(); // dynamic mount/unmount of connected controllers (no-op unless enabled)
 	faultDiagSetStage(8);

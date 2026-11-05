@@ -22,7 +22,7 @@ offset  size  meaning
 0x08    16    controller serial, ASCII, not null-terminated if fully filled
 ```
 
-The puck stores four independent bond slots. Slot `N` is exposed as USB HID interface `N`.
+The puck stores four independent bond slots. In Steam mode each slot has its own USB HID interface; Xbox mode selects only one RF controller for one static USB gamepad (§9.2).
 
 An empty slot is all zeroes.
 
@@ -46,14 +46,17 @@ Feature payload framing is:
 [cmd][len][payload...]
 ```
 
+
 Implemented commands:
 
-- `0x83`: attribute block
-- `0xAE`: string attribute
-- `0xB4`: connection state for the interface's slot
-- `0xAD`: pairing mode enable/disable
-- `0xA2`: write or clear the interface's 24-byte bond slot
-- `0xA3`: read the interface's 24-byte bond slot
+- `0x83`: `GET_ATTRIBUTES_VALUES`
+- `0xAE`: `GET_STRING_ATTRIBUTE`
+- `0xB4`: `DONGLE_GET_WIRELESS_STATE` (connection state for the interface's slot)
+- `0xAD`: `ENABLE_PAIRING` (pairing mode enable/disable)
+- `0xA2`: `TRITON_A2_OBSERVED_PAIRING_RECORD` (write or clear the interface's 24-byte bond slot)
+- `0xA3`: `TRITON_A3_BOND_EVENT_OR_STATUS` (read the interface's 24-byte bond slot)
+
+For a full list of commands the controller supports, check steam_commands.h
 
 #### `0xB4` response
 
@@ -82,30 +85,16 @@ When Steam writes feature report `0x01`, OpenPuck forwards it over RF to the con
 containing a sub-TLV. There are two on-air forms:
 
 ```text
-legacy   [E3][1+len][0x05][report_id][data...]              (no inner-len)
-landing  [E3][2+len][0x01][report_id][innerlen][data...]    (type 01, KEEPS inner-len; controller ACTS on it)
+haptic   [E3][1+len][0x05][report_id][data...]             (type 05, no inner-len)
+normal  [E3][2+len][0x01][report_id][innerlen][data...]    (type 01, KEEPS inner-len)
 ```
 
-A command only **lands** on the controller in the `landing` form (type `0x01` — the same type byte the GET poll
-uses, `E3 02 01 45 <param>`; the `report_id` selects the action, `innerlen` is the report's own `[len]`). In the
-`legacy` form the controller discards any `0x87+` command (it reads the first data byte as the length).
-
-**OpenPuck sends the `legacy` form for everything EXCEPT a tight whitelist** — only LED brightness (`0x87` whose
-first register byte is `0x2D`) and controller power-off (`0x9F`) use the `landing` form:
 
 ```text
 haptic on    E3 04 05 82 01 01 F7              (report 0x82, legacy)
-brightness   E3 05 01 87 03 2D <val> 00        (report 0x87 reg 0x2D, LANDING -- whitelisted)
-power-off    E3 06 01 9F 04 6F 66 66 21        (report 0x9F "off!", LANDING -- whitelisted)
-Steam 0x87 cfg  E3 .. 05 87 ..                 (haptic/IMU config: legacy -> DISCARDED, by design)
+brightness   E3 05 01 87 03 2D <val> 00        (report 0x87 reg 0x2D, LANDING)
+power-off    E3 06 01 9F 04 6F 66 66 21        (report 0x9F "off!", LANDING)
 ```
-
-**Why the whitelist is tight, not "land everything `0x87+`":** Steam continuously writes its own `0x87`
-passthrough during normal play — the haptic-config block including reg `0x30` (IMU/subsystem enable) and
-`0x34/0x35` (haptic amplitude). If those *land*, reg `0x30` **freezes the controller's gyro stream** and
-`0x34/0x35` drive the **connect-time buzz**. The long-working build never landed any `0x87`, so neither happened.
-Landing the whole class regresses both (stuck gyro + buzz); landing only the brightness register and power-off
-adds those two features while leaving Steam's config writes discarded exactly as before.
 
 The relay carries the command's declared length, up to 60 bytes — the most one RF frame fits. Relays are staged
 in a small ring (not a single buffer): the USB SET callbacks run in ISR context and Steam sends
@@ -314,12 +303,12 @@ offset  size  meaning
 
 The RF side stays the same across modes. Only USB enumeration changes.
 
-There are three switchable modes (`0=Steam 1=Xbox 2=Switch`). Steam mode is a CDC + WebUSB composite;
-Xbox and Switch are **clean controller-only** devices — the auto-added CDC/WebUSB
-interfaces are torn down (`clearConfiguration`) and `bcdUSB` stays `0x0200` (no USB-2.1 BOS). This is
-required because Windows' `xusb` driver expects the Xbox 360 controller on the primary device/interface,
-and a real Switch console rejects composite devices. Every boot/mode-switch
-does a `detach -> rebuild -> attach` so the host re-reads the descriptor cleanly.
+USB personalities include Steam (`0`), Xbox 360 (`1`), Hori (`2`), Switch Pro (`4`),
+and the other modes listed in [../README.md](../README.md). Xbox 360 uses a static
+wired-controller layout: `clearConfiguration` removes the auto-added interfaces,
+and `bcdUSB` remains `0x0200` (no USB-2.1 BOS). It has no CDC, WebUSB, mouse, or wake
+HID. Mode switches detach and reboot to rebuild the USB descriptors; Xbox RF
+joins/departures do not change its USB layout or trigger re-enumeration.
 
 ### 9.1 Steam mode
 
@@ -344,14 +333,71 @@ does a `detach -> rebuild -> attach` so the host re-reads the descriptor cleanly
   **connected slot only** (the slot gate is what stops a haptic aimed at another of the four exposed
   slots from buzzing the single controller). The 63-byte settings/config reports `0x87`/`0x88`/`0x89`
   are not haptics and are not pushed on this path (`0x87` lizard-off reaches the controller via the
-  feature `0x01` passthrough). Restricting this to `0x82` alone silently dropped the ping/grip/test
+  feature `0x01` passthrough). Steam owns `IMU_MODE` in native puck mode. Switch Pro mode instead writes
+  raw accelerometer + gyroscope (`0x18`) when the RF link comes up because the controller retains Steam's
+  IMU-off state across pucks. Restricting haptics to `0x82` alone silently dropped the ping/grip/test
   haptics, which use other report IDs.
+
+#### ⚠️ Two different `0x8x` id spaces — never share a rule between them
+
+Steam drives the actuators through the Triton **OUTPUT report** space, which is a *different* id space
+from the feature-`0x01` **command** space even though the numbers overlap. Ground truth: SDL
+`src/joystick/hidapi/steam/controller_structs.h` (`ValveTritonOutReportMessageIDs`) and
+`controller_constants.h`. The payload sizes match this firmware's report descriptor exactly:
+
+| id | OUTPUT report (haptics/actuators) | payload | feature `0x01` command |
+|----|-----------------------------------|---------|------------------------|
+| `0x80` | `HAPTIC_RUMBLE` `[type][intensity u16][{speed u16,gain}L][{…}R]` | 9 | `SET_DIGITAL_MAPPINGS` |
+| `0x81` | `HAPTIC_PULSE` `[side][on_us u16][off_us u16][repeat u16]` | 7 | `CLEAR_DIGITAL_MAPPINGS` |
+| `0x82` | `HAPTIC_COMMAND` `[side][command][gain_db]` | 3 | `GET_DIGITAL_MAPPINGS` |
+| `0x83` | `HAPTIC_LFO_TONE` `[side][gain_db][freq u16][dur u16][lfo_freq u16][lfo_depth]` | 9 | `GET_ATTRIBUTES_VALUES` |
+| `0x84` | `HAPTIC_LOG_SWEEP` `[side][gain_db][dur u16][start u16][end u16]` | 8 | `GET_ATTRIBUTE_LABEL` |
+| `0x85` | `HAPTIC_SCRIPT` `[side][script_id][gain_db]` | 3 | `SET_DEFAULT_DIGITAL_MAPPINGS` |
+| `0x86` | (unnamed) | 3 | `FACTORY_RESET` |
+| `0x87`+ | 63-byte settings/config | 63 | `SET_SETTINGS_VALUES` … |
+
 
 ### 9.2 Xbox mode
 
-- VID:PID `045E:028E`, clean device (no CDC/WebUSB)
-- Custom XInput-compatible vendor interface on `MI_00` + HID boot mouse on `MI_01` (right-pad emulation)
-- `0x45` is converted into a 20-byte XInput report
+- `MODE_XBOX` (`1`): one static wired Xbox 360 pad, Microsoft VID:PID `045E:028E`,
+  `bcdDevice=0x0114`, device class/subclass/protocol `FF/FF/FF`.
+- Four vendor interfaces: control (`0`, `FF/5D/01`), audio (`1`, `FF/5D/03`,
+  no accessory), plugin (`2`, `FF/5D/02`, no accessory), security (`3`,
+  `FF/FD/13`). Only gamepad endpoints `0x81` IN and `0x02` OUT are opened;
+  the advertised accessory endpoints are not serviced. Configuration length
+  is 153 bytes (9-byte header + 144-byte body).
+- The first fresh report from a live RF bond selects the controller. Selection
+  stays fixed through brief gaps, until more than 1200 ms without an RF reply
+  (or bond removal). RF injects synthetic neutral input after 300 ms of silence;
+  that releases held inputs but cannot acquire an unselected bond. A replacement
+  controller does not require USB re-enumeration.
+- `0x45` is converted into a 20-byte input report, including Guide. Valid rumble
+  OUT packets are relayed only to the selected RF controller. Headset/chatpad
+  functions are **not emulated**. LED commands are parsed, but the physical
+  player ring is not equivalent to a genuine Xbox 360 pad.
+- Retail XSM3 authentication runs in software using libxsm3 on the nRF52840:
+  no donor controller, USB host adapter, or additional hardware. This is wired
+  USB authentication, not Xbox wireless RF pairing.
+- Vendor requests `0x81` (identification), `0x82` (init), `0x86` (status),
+  `0x83` (response), and `0x87` (verify) are handled through EP0. Init/verify
+  require exactly 34/22 received bytes; invalid lengths, checksums, or MACs fail
+  closed without a ready/stale response. USB RESET invalidates pending work so
+  a worker finishing afterward cannot publish its old result. USB and XSM3
+  identification use a stable, hardware-derived 12-character serial.
+- A dedicated idle-priority crypto task has a 2048-word (8 KiB) stack, separate
+  from the small USB-task stack. The main loop lends it 1 ms between RF polls
+  only while authentication work is pending/running, never inside an RX window.
+- The string callback wrapper supplies the full **178-byte** security string
+  descriptor at index 4 (88 UTF-16 code units plus header), avoiding the core's
+  truncation. Vendor-routing and EP0 received-length wrappers are also required;
+  see [BUILD_AND_DEPLOY.md](BUILD_AND_DEPLOY.md).
+
+Configure in Steam mode using fixed **back-4 + A**, then return with **back-4 + X**
+(default, configurable). Xbox has no mouse, WebUSB, CDC, or wake HID. See
+[XBOX360.md](XBOX360.md) for licensing and physical tests. **Stock-console support
+is experimental, not verified compatibility:** the default Adafruit nRF52 1.7.0
+build passed, but the firmware has not been flashed or console-tested. Independent
+synthetic native fixtures are not evidence of acceptance by a real console.
 
 ### 9.3 Switch mode
 
@@ -359,19 +405,37 @@ does a `detach -> rebuild -> attach` so the host re-reads the descriptor cleanly
 - Single HID interface with the canonical HORIPAD descriptor (interrupt IN + OUT endpoints), accepted by
   a real Switch console with no handshake; an 8-byte report is streamed at ~250 Hz
 
+### 9.4 Original Xbox mode
+
+- VID:PID `045E:0289` (Microsoft Controller S). Composite: the XID interface plus the wake mouse and
+  the WebUSB panel, so the config panel stays reachable on a PC
+- Proprietary XID interface (class `0x58`, subclass `0x42`, protocol `0x00`) with interrupt IN +
+  OUT endpoints; 20-byte input reports, rumble applied from the OUT endpoint
+- The console refuses the controller until three `0xC1` vendor control requests are answered:
+  `bRequest 0x06` / `wValue 0x4200` (XID descriptor), and `bRequest 0x01` with `wValue 0x0100` /
+  `0x0200` (input and output capabilities)
+- Also answers the XID report requests the protocol carries on EP0, in parallel with the interrupt
+  endpoints: `GET_REPORT` (`0xA1 0x01`, `wValue 0x0100`) and `SET_REPORT` (`0x21 0x09`, `wValue 0x0200`)
+
 ## 10. WebUSB control channel
 
-The WebUSB vendor interface is present only in Steam mode (Xbox/Switch are clean controllers with no
-config interface — configure them from Steam mode or switch via the back-paddle chord).
+The WebUSB vendor interface is absent in Xbox 360 and clean PlayStation modes.
+For Xbox configuration or updates, return to Steam mode with **back-4 + A**, use
+the panel on a PC, then **back-4 + X** (default assignment) to return to Xbox.
 
 Messages:
 
 - Host to device:
   - `0x01`: get status blob
-  - `0x02 <field> <value>`: set one field
+  - `0x02 <field> <value>`: set one field. Notable fields: `22` host-rumble strength as **percent/2**
+    (10–500%, revived in blob version 21), `39` host-rumble style (`RUMBLE_STYLE_*` in `haptics.h`:
+    0 normal, 1 mono, 2 heavy, 3 light, 4 swapped, 5 punchy, 6 soft), `38` Switch Pro gyro mapping
   - `0x03 <mode>`: switch mode and reboot
   - `0x07`: re-init haptics (clear a stuck buzz)
   - `0x08`: send controller power-off
+  - `0x16`: test rumble — buzz every linked controller with the configured style/strength for 500 ms,
+    auto-stopped by the firmware. **Requires status-blob version ≥ 21**; older firmware drops it silently
+    (the parser only accepts `0x01`–`0x15` and `0x20`–`0x25`).
   - `0x09`: export all bond slots (reply: `0xA7` frame) — see §10.1
   - `0x0A 0x45 0x52 0x53`: factory erase (`"ERS"` magic), then reboot
   - `0x0B` / `0x0C`: reboot into serial DFU / UF2 bootloader
@@ -416,8 +480,8 @@ Status blob payload:
 ```text
 [0]  version
 [1]  usb mode
-[2]  xbox mouse sensitivity divisor
-[3]  xbox mouse friction
+[2]  legacy xbox mouse sensitivity divisor (no mouse in MODE_XBOX)
+[3]  legacy xbox mouse friction (no mouse in MODE_XBOX)
 [4]  steam pad smoothing
 [5]  A/B + X/Y swap
 [6]  back mapping 0
@@ -438,6 +502,15 @@ Status blob payload:
 [21] QoS auto-hop flag
 [22] persist-mode flag
 ```
+
+Later fields are appended (the version byte says how far the payload goes). From version 20 the tail carries
+the per-emulated-type trackpad-to-stick mapping at payload bytes 187..194 — two bytes per type
+(`{left pad, right pad}`), each `0` off / `1` left stick / `2` right stick. Set with
+`0x02 <80 + type*2 + pad> <value>`. Fields 40..75 are the per-type config block, so the mapping starts at 80.
+A mapped pad **blends** with its stick: while the pad is touched each axis reports whichever of the two
+sources is deflected further from center (signed); an untouched pad contributes nothing and the physical
+stick passes straight through. A mapped pad also stops reporting as a touchpad contact / mouse.
+
 
 ### 10.1 Backup / clone (bond export & import)
 
@@ -469,7 +542,7 @@ Bonds are written one slot at a time so no command exceeds a single USB-FS packe
 acked with a status blob so the host's read-after-write keeps the OUT pipe flowing. The panel sends all four
 `0x0D` slot writes plus every config field via `0x02`, then a single `0x0E` to persist and reboot — so the
 reboot regenerates the session addresses from the new UUIDs and the restored puck reproduces both the pairings
-and all settings. Other settings (mouse, rumble, chords, per-type button maps, Switch Pro motion) ride in the
+and all settings. Other settings (mouse, chords, per-type button maps, Switch Pro gyro mapping) ride in the
 backup file as plain `0x02` field values, not in the bond commands.
 
 ## 11. Timing notes
@@ -491,6 +564,6 @@ To build a compatible puck from scratch:
 6. Poll with `E7` then `E3 GET 0x45`.
 7. Parse `F1` and unpack report `0x45`.
 8. Relay host feature writes to the controller as `E3` SET sub-TLVs.
-9. Re-enumerate USB cleanly when switching Steam/Xbox/Switch modes (Xbox/Switch as clean non-composite devices).
+9. Re-enumerate USB cleanly when switching modes; Xbox uses the fixed four-vendor-interface layout in §9.2, not a gamepad/mouse composite or a dynamic multi-pad layout.
 
 If those pieces match, the controller-to-puck protocol is fully reimplemented.

@@ -92,9 +92,10 @@ static void switchBuildHoripad(uint8_t slot, uint8_t out[8])
 	// QAM (3 dots) remap: the configured code is applied to the Switch output just like a back paddle below
 	// (so Capture(18) and every Switch target work). 0 = unmapped -> QAM does nothing on Switch.
 	bool qam = g_qamMap && (b & TB_QAM);
-	// Mode-switch chord (all 4 back + A/X/Y): don't pass the face press to the console while the back-4 are held.
+	// Mode-switch chord (all 4 back + face/dpad): don't pass the press to the console while the back-4 are held.
 	if ((b & CHORD_BACK4) == CHORD_BACK4)
-		b &= ~(uint32_t)(TB_A | TB_X | TB_Y);
+		b &= ~(uint32_t)(TB_A | TB_X | TB_Y | TB_DUP | TB_DDN | TB_DLF |
+				 TB_DRT);
 	// face buttons with optional A/B + X/Y swap (Nintendo physical-vs-label layout)
 	uint16_t fY = g_abSwap ? 0x08 : 0x01, fB = g_abSwap ? 0x04 : 0x02,
 		 fA = g_abSwap ? 0x02 : 0x04, fX = g_abSwap ? 0x01 : 0x08;
@@ -168,11 +169,12 @@ static void switchBuildHoripad(uint8_t slot, uint8_t out[8])
 	out[0] = btn & 0xFF;
 	out[1] = btn >> 8;
 	out[2] = hat;
-	out[3] = swStick(g_in[slot].lx, false);
-	out[4] = swStick(g_in[slot].ly,
-			 true); // HID Y is down-positive -> invert
-	out[5] = swStick(g_in[slot].rx, false);
-	out[6] = swStick(g_in[slot].ry, true);
+	int16_t lx, ly, rx, ry;
+	slotSticks(slot, &lx, &ly, &rx, &ry);
+	out[3] = swStick(lx, false);
+	out[4] = swStick(ly, true); // HID Y is down-positive -> invert
+	out[5] = swStick(rx, false);
+	out[6] = swStick(ry, true);
 	out[7] = 0;
 }
 
@@ -189,6 +191,7 @@ uint8_t SwitchHoriController::maxSlots() const
 void SwitchHoriController::usbIdentity()
 {
 	USBDevice.setID(0x0F0D, 0x0092);
+	USBDevice.setVersion(0x0200);
 	USBDevice.setDeviceVersion(0x0210);
 	USBDevice.setManufacturerDescriptor("HORI CO.,LTD.");
 	USBDevice.setProductDescriptor("POKKEN CONTROLLER");
